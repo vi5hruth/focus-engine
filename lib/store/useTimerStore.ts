@@ -15,8 +15,41 @@ const DEFAULT_POMODORO_CONFIG: PomodoroConfig = {
   cyclesBeforeLongBreak: 4,
 };
 
-function todayKey(): string {
-  return new Date().toISOString().slice(0, 10);
+/**
+ * Returns YYYY-MM-DD in the user's LOCAL timezone, avoiding UTC boundary glitches.
+ */
+function getLocalDateKey(d = new Date()): string {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Calculates if yesterday was the previous active day in local calendar time.
+ */
+/**
+ * Calculates if yesterday was the previous active day in local calendar time.
+ */
+function isConsecutiveDay(lastDateStr: string | null, todayStr: string): boolean {
+  if (!lastDateStr) return false;
+
+  const lastParts = lastDateStr.split("-").map(Number);
+  const todayParts = todayStr.split("-").map(Number);
+
+  if (lastParts.length !== 3 || todayParts.length !== 3) return false;
+
+  const [ly, lm, ld] = lastParts as [number, number, number];
+  const [ty, tm, td] = todayParts as [number, number, number];
+
+  const lastDate = new Date(ly, lm - 1, ld);
+  const today = new Date(ty, tm - 1, td);
+
+  const diffMs = today.getTime() - lastDate.getTime();
+  const oneDayMs = 86_400_000;
+
+  // Account for daylight saving variance (23-25 hours)
+  return diffMs >= oneDayMs - 3_600_000 && diffMs <= oneDayMs + 3_600_000;
 }
 
 function initialState(): TimerSessionState {
@@ -43,8 +76,6 @@ interface TimerStore extends TimerSessionState {
   soundEnabled: boolean;
   ambientTrack: "none" | "pink" | "brown" | "drone";
 
-  // derived helpers (pure, take `now` explicitly — never read Date.now()
-  // internally so components stay render-pure and testable)
   getElapsedMs: (now: number) => number;
   getPhaseRemainingMs: (now: number) => number;
 
@@ -57,8 +88,6 @@ interface TimerStore extends TimerSessionState {
   setActiveTask: (taskId: string | null) => void;
   configurePomodoro: (config: Partial<PomodoroConfig>) => void;
   advancePomodoroPhase: () => void;
-  /** called every worker tick; only mutates volatile-but-necessary fields */
-  registerCompletionCredit: (now: number, seconds: number) => void;
   toggleSound: () => void;
   setAmbientTrack: (track: "none" | "pink" | "brown" | "drone") => void;
 }
@@ -87,14 +116,15 @@ export const useTimerStore = create<TimerStore>()(
       start: (now) =>
         set((s) => {
           if (s.status === "running") return s;
-          const today = todayKey();
+          const today = getLocalDateKey();
           let streakDays = s.streakDays;
+
           if (s.lastActiveDate !== today) {
-            const yesterday = new Date(Date.now() - 86_400_000)
-              .toISOString()
-              .slice(0, 10);
-            streakDays = s.lastActiveDate === yesterday ? streakDays + 1 : 1;
+            streakDays = isConsecutiveDay(s.lastActiveDate, today)
+              ? streakDays + 1
+              : 1;
           }
+
           return {
             status: "running",
             segmentStartedAt: now,
@@ -107,10 +137,15 @@ export const useTimerStore = create<TimerStore>()(
         set((s) => {
           if (s.status !== "running" || s.segmentStartedAt === null) return s;
           const elapsedThisSegment = Math.max(0, now - s.segmentStartedAt);
-          const today = todayKey();
+          const today = getLocalDateKey();
+
           const dailyStudySeconds = { ...s.dailyStudySeconds };
-          dailyStudySeconds[today] =
-            (dailyStudySeconds[today] ?? 0) + elapsedThisSegment / 1000;
+          // Only credit study seconds if in focus phase or chronograph mode
+          if (s.mode === "chronograph" || s.pomodoro.phase === "focus") {
+            dailyStudySeconds[today] =
+              (dailyStudySeconds[today] ?? 0) + elapsedThisSegment / 1000;
+          }
+
           return {
             status: "paused",
             segmentStartedAt: null,
@@ -128,13 +163,13 @@ export const useTimerStore = create<TimerStore>()(
       reset: () =>
         set((s) => ({
           ...initialState(),
-          // preserve cross-session stats & preferences
           dailyStudySeconds: s.dailyStudySeconds,
           streakDays: s.streakDays,
           lastActiveDate: s.lastActiveDate,
           pomodoro: {
             ...initialState().pomodoro,
             config: s.pomodoro.config,
+            phaseTargetMs: s.pomodoro.config.focusMinutes * 60_000,
           },
         })),
 
@@ -157,10 +192,14 @@ export const useTimerStore = create<TimerStore>()(
       setMode: (mode) =>
         set((s) => ({
           mode,
+          status: "idle",
+          segmentStartedAt: null,
+          accumulatedMs: 0,
           pomodoro:
             mode === "pomodoro"
               ? {
                   ...s.pomodoro,
+                  phase: "focus",
                   phaseTargetMs: s.pomodoro.config.focusMinutes * 60_000,
                 }
               : s.pomodoro,
@@ -171,25 +210,41 @@ export const useTimerStore = create<TimerStore>()(
       configurePomodoro: (config) =>
         set((s) => {
           const merged = { ...s.pomodoro.config, ...config };
+          const phaseTargetMs =
+            s.pomodoro.phase === "focus"
+              ? merged.focusMinutes * 60_000
+              : s.pomodoro.phase === "shortBreak"
+                ? merged.breakMinutes * 60_000
+                : merged.longBreakMinutes * 60_000;
+
           return {
             pomodoro: {
               ...s.pomodoro,
               config: merged,
-              phaseTargetMs:
-                s.pomodoro.phase === "focus"
-                  ? merged.focusMinutes * 60_000
-                  : s.pomodoro.phase === "shortBreak"
-                    ? merged.breakMinutes * 60_000
-                    : merged.longBreakMinutes * 60_000,
+              phaseTargetMs,
             },
           };
         }),
 
       advancePomodoroPhase: () =>
         set((s) => {
+          const now = Date.now();
           const cfg = s.pomodoro.config;
           let phase = s.pomodoro.phase;
           let cycleCount = s.pomodoro.cycleCount;
+
+          // Commit final running segment before resetting
+          const finalSegmentMs =
+            s.status === "running" && s.segmentStartedAt !== null
+              ? Math.max(0, now - s.segmentStartedAt)
+              : 0;
+
+          const dailyStudySeconds = { ...s.dailyStudySeconds };
+          if (phase === "focus" && finalSegmentMs > 0) {
+            const today = getLocalDateKey();
+            dailyStudySeconds[today] =
+              (dailyStudySeconds[today] ?? 0) + finalSegmentMs / 1000;
+          }
 
           if (phase === "focus") {
             cycleCount += 1;
@@ -212,16 +267,9 @@ export const useTimerStore = create<TimerStore>()(
             status: "idle",
             segmentStartedAt: null,
             accumulatedMs: 0,
+            dailyStudySeconds,
             pomodoro: { ...s.pomodoro, phase, cycleCount, phaseTargetMs },
           };
-        }),
-
-      registerCompletionCredit: (now, seconds) =>
-        set((s) => {
-          const today = todayKey();
-          const dailyStudySeconds = { ...s.dailyStudySeconds };
-          dailyStudySeconds[today] = (dailyStudySeconds[today] ?? 0) + seconds;
-          return { dailyStudySeconds };
         }),
 
       toggleSound: () => set((s) => ({ soundEnabled: !s.soundEnabled })),
@@ -245,9 +293,6 @@ export const useTimerStore = create<TimerStore>()(
         ambientTrack: s.ambientTrack,
       }),
       onRehydrateStorage: () => (state) => {
-        // If the tab was closed mid-run, convert the dangling running
-        // segment into paused accumulation using wall-clock now, so we
-        // never silently "lose" or over-count time on reload.
         if (state && state.status === "running" && state.segmentStartedAt) {
           const now = Date.now();
           const elapsed = Math.max(0, now - state.segmentStartedAt);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 interface ShortcutHandlers {
   onToggle: () => void;
@@ -10,54 +10,73 @@ interface ShortcutHandlers {
   onShowCheatSheet: () => void;
 }
 
+/**
+ * Robust check for active editable contexts, including custom ARIA textboxes
+ */
 function isTypingTarget(el: EventTarget | null): boolean {
   if (!(el instanceof HTMLElement)) return false;
   const tag = el.tagName.toLowerCase();
+  const role = el.getAttribute("role");
+
   return (
     tag === "input" ||
     tag === "textarea" ||
     tag === "select" ||
-    el.isContentEditable
+    el.isContentEditable ||
+    role === "textbox" ||
+    role === "searchbox" ||
+    role === "combobox"
   );
 }
 
-export function useKeyboardShortcuts({
-  onToggle,
-  onSplit,
-  onReset,
-  onCommandPalette,
-  onShowCheatSheet,
-}: ShortcutHandlers) {
+export function useKeyboardShortcuts(handlers: ShortcutHandlers) {
+  // Store handlers in a ref to decouple listener lifecycle from render closures
+  const handlersRef = useRef(handlers);
+  handlersRef.current = handlers;
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      const cmdK = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k";
-      if (cmdK) {
+      // 1. Ignore repeated keydowns from holding a key
+      if (e.repeat) return;
+
+      const isModifierActive = e.metaKey || e.ctrlKey || e.altKey;
+
+      // 2. Global Command Palette: Cmd+K / Ctrl+K (allowed even inside inputs)
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
-        onCommandPalette();
+        handlersRef.current.onCommandPalette();
         return;
       }
 
+      // 3. Escape all normal shortcuts if the user is typing into an input
       if (isTypingTarget(e.target)) return;
+
+      // 4. Protect browser native combos (Cmd+R refresh, Cmd+S save, etc.)
+      if (isModifierActive) return;
 
       switch (e.key) {
         case " ":
           e.preventDefault();
-          onToggle();
+          handlersRef.current.onToggle();
           break;
+
         case "s":
         case "S":
           e.preventDefault();
-          onSplit();
+          handlersRef.current.onSplit();
           break;
+
         case "r":
         case "R":
           e.preventDefault();
-          onReset();
+          handlersRef.current.onReset();
           break;
+
         case "?":
           e.preventDefault();
-          onShowCheatSheet();
+          handlersRef.current.onShowCheatSheet();
           break;
+
         default:
           break;
       }
@@ -65,5 +84,5 @@ export function useKeyboardShortcuts({
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [onToggle, onSplit, onReset, onCommandPalette, onShowCheatSheet]);
+  }, []); // Mounts strictly once; zero listener thrashing
 }

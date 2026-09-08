@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, memo } from "react";
 import { Plus, Target, Check, Trash2, Flame, Clock3 } from "lucide-react";
 import { useTaskStore } from "@/lib/store/useTaskStore";
 import { useTimerStore } from "@/lib/store/useTimerStore";
@@ -15,22 +15,21 @@ const PRIORITY_STYLE: Record<TaskPriority, string> = {
   low: "border-zinc-800 bg-zinc-800/40 text-zinc-400",
 };
 
-function TaskRow({ task }: { task: Task }) {
-  const activeTaskId = useTimerStore((s) => s.activeTaskId);
-  const status = useTimerStore((s) => s.status);
+/**
+ * TaskRow is memoized and does NOT subscribe to useClockStore.now.
+ * It renders purely on task changes or focus status changes.
+ */
+const TaskRow = memo(function TaskRow({ task }: { task: Task }) {
+  // Discrete subscriptions (no high-frequency 10Hz ticks)
+  const isFocused = useTimerStore((s) => s.activeTaskId === task.id);
+  const isRunning = useTimerStore((s) => s.status === "running" && s.activeTaskId === task.id);
   const setActiveTask = useTimerStore((s) => s.setActiveTask);
-  const getElapsedMs = useTimerStore((s) => s.getElapsedMs);
-  const laps = useTimerStore((s) => s.laps);
   const resetTimer = useTimerStore((s) => s.reset);
-  const now = useClockStore((s) => s.now);
 
   const toggleComplete = useTaskStore((s) => s.toggleComplete);
   const removeTask = useTaskStore((s) => s.removeTask);
   const addTimeSpent = useTaskStore((s) => s.addTimeSpent);
   const attachLapBreakdowns = useTaskStore((s) => s.attachLapBreakdowns);
-
-  const isFocused = activeTaskId === task.id;
-  const isRunning = isFocused && status === "running";
 
   function handleFocusThis() {
     setActiveTask(isFocused ? null : task.id);
@@ -38,12 +37,29 @@ function TaskRow({ task }: { task: Task }) {
 
   function handleMarkDone() {
     if (isFocused) {
-      const elapsedSeconds = getElapsedMs(now) / 1000;
-      if (elapsedSeconds > 0) addTimeSpent(task.id, elapsedSeconds);
-      if (laps.length > 0) attachLapBreakdowns(task.id, laps);
+      // Read now imperatively from the store to avoid subscription churn
+      const now = useClockStore.getState().now;
+      const timerState = useTimerStore.getState();
+      const elapsedSeconds = timerState.getElapsedMs(now) / 1000;
+
+      if (elapsedSeconds > 0) {
+        addTimeSpent(task.id, elapsedSeconds);
+      }
+      if (timerState.laps.length > 0) {
+        attachLapBreakdowns(task.id, timerState.laps);
+      }
       resetTimer();
+      setActiveTask(null);
     }
     toggleComplete(task.id);
+  }
+
+  function handleDelete() {
+    // If deleting the currently focused task, unbind it first
+    if (isFocused) {
+      setActiveTask(null);
+    }
+    removeTask(task.id);
   }
 
   return (
@@ -90,9 +106,11 @@ function TaskRow({ task }: { task: Task }) {
           )}
         </div>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
-          <span className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-zinc-500">
-            {task.subjectTag}
-          </span>
+          {task.subjectTag && (
+            <span className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-zinc-500">
+              {task.subjectTag}
+            </span>
+          )}
           <span
             className={cn(
               "rounded border px-1.5 py-0.5 capitalize",
@@ -123,7 +141,7 @@ function TaskRow({ task }: { task: Task }) {
           </Button>
         )}
         <button
-          onClick={() => removeTask(task.id)}
+          onClick={handleDelete}
           aria-label="Delete task"
           className="rounded p-1.5 text-zinc-600 hover:bg-red-500/10 hover:text-red-400"
         >
@@ -132,7 +150,7 @@ function TaskRow({ task }: { task: Task }) {
       </div>
     </div>
   );
-}
+});
 
 function AddTaskForm({ onDone }: { onDone: () => void }) {
   const addTask = useTaskStore((s) => s.addTask);
@@ -145,8 +163,8 @@ function AddTaskForm({ onDone }: { onDone: () => void }) {
     e.preventDefault();
     if (!title.trim()) return;
     addTask({
-      title,
-      subjectTag,
+      title: title.trim(),
+      subjectTag: subjectTag.trim() || "General",
       priority,
       estimatedMinutes: estimatedMinutes ? Number(estimatedMinutes) : undefined,
     });

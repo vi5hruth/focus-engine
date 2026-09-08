@@ -16,6 +16,10 @@ class ProceduralAudioEngine {
   private ambientNode: AudioBufferSourceNode | OscillatorNode[] | null = null;
   private ambientGain: GainNode | null = null;
   private currentTrack: AmbientTrack = "none";
+  private stopTimeoutId: number | null = null;
+
+  // Cache buffers to prevent CPU churn and GC pauses on track toggle
+  private bufferCache: Map<string, AudioBuffer> = new Map();
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
@@ -34,16 +38,27 @@ class ProceduralAudioEngine {
     return this.ctx;
   }
 
-  /** Generates a looping AudioBuffer of pink or brown noise. */
-  private buildNoiseBuffer(kind: "pink" | "brown"): AudioBuffer {
+  /**
+   * Pre-warms the AudioContext on an explicit user interaction (e.g., clicking start),
+   * ensuring background chimes don't get blocked by browser autoplay policies.
+   */
+  public warmup() {
+    this.ensureContext();
+  }
+
+  /** Generates or retrieves a cached looping AudioBuffer of pink or brown noise. */
+  private getNoiseBuffer(kind: "pink" | "brown"): AudioBuffer {
     const ctx = this.ensureContext();
+    const cacheKey = `${kind}-${ctx.sampleRate}`;
+    const cached = this.bufferCache.get(cacheKey);
+    if (cached) return cached;
+
     const length = ctx.sampleRate * NOISE_BUFFER_SECONDS;
     const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
     const data = buffer.getChannelData(0);
 
     if (kind === "pink") {
-      // Paul Kellett's refined pink noise filter — sums correlated white
-      // noise taps so energy falls off at ~3dB/octave.
+      // Paul Kellett's refined pink noise filter (~3dB/octave falloff)
       let b0 = 0,
         b1 = 0,
         b2 = 0,
@@ -64,8 +79,7 @@ class ProceduralAudioEngine {
         data[i] = pink * 0.11;
       }
     } else {
-      // Brown noise: integrated (random-walk) white noise, normalized to
-      // prevent unbounded drift.
+      // Brown noise: integrated random-walk
       let lastOut = 0;
       for (let i = 0; i < length; i++) {
         const white = Math.random() * 2 - 1;
@@ -73,6 +87,8 @@ class ProceduralAudioEngine {
         data[i] = lastOut * 3.5;
       }
     }
+
+    this.bufferCache.set(cacheKey, buffer);
     return buffer;
   }
 
@@ -82,6 +98,7 @@ class ProceduralAudioEngine {
         this.ambientNode.forEach((osc) => {
           try {
             osc.stop();
+            osc.disconnect();
           } catch {
             /* already stopped */
           }
@@ -89,13 +106,14 @@ class ProceduralAudioEngine {
       } else {
         try {
           this.ambientNode.stop();
+          this.ambientNode.disconnect();
         } catch {
           /* already stopped */
         }
       }
       this.ambientNode = null;
     }
-    if (this.ambientGain && this.ctx) {
+    if (this.ambientGain) {
       this.ambientGain.disconnect();
       this.ambientGain = null;
     }
@@ -103,16 +121,23 @@ class ProceduralAudioEngine {
 
   setAmbient(track: AmbientTrack) {
     const ctx = this.ensureContext();
+
+    // Cancel any pending stop timeouts to avoid race conditions on quick toggles
+    if (this.stopTimeoutId !== null) {
+      window.clearTimeout(this.stopTimeoutId);
+      this.stopTimeoutId = null;
+    }
+
     this.stopAmbientInternal();
     this.currentTrack = track;
     if (track === "none") return;
 
     const gain = ctx.createGain();
-    gain.gain.value = 0;
+    gain.gain.setValueAtTime(0, ctx.currentTime);
     gain.connect(this.masterGain!);
     this.ambientGain = gain;
 
-    // fade in to avoid a click
+    // Smooth linear ramp without click
     gain.gain.linearRampToValueAtTime(
       track === "drone" ? DRONE_GAIN : NOISE_GAIN,
       ctx.currentTime + 0.6
@@ -120,11 +145,9 @@ class ProceduralAudioEngine {
 
     if (track === "pink" || track === "brown") {
       const source = ctx.createBufferSource();
-      source.buffer = this.buildNoiseBuffer(track);
+      source.buffer = this.getNoiseBuffer(track);
       source.loop = true;
 
-      // gentle lowpass so the noise reads as "focus ambience" rather than
-      // static/hiss.
       const filter = ctx.createBiquadFilter();
       filter.type = "lowpass";
       filter.frequency.value = track === "pink" ? 3200 : 900;
@@ -133,8 +156,6 @@ class ProceduralAudioEngine {
       source.start();
       this.ambientNode = source;
     } else if (track === "drone") {
-      // Layered detuned oscillators around a low root frequency produce a
-      // soft, non-fatiguing focus drone.
       const rootFreq = 110; // A2
       const detunes = [0, 5, -7, 12];
       const oscillators = detunes.map((detune, idx) => {
@@ -142,6 +163,7 @@ class ProceduralAudioEngine {
         osc.type = idx % 2 === 0 ? "sine" : "triangle";
         osc.frequency.value = rootFreq * (idx === 3 ? 1.5 : 1);
         osc.detune.value = detune;
+
         const oscGain = ctx.createGain();
         oscGain.gain.value = idx === 0 ? 1 : 0.4;
         osc.connect(oscGain);
@@ -159,10 +181,24 @@ class ProceduralAudioEngine {
       this.currentTrack = "none";
       return;
     }
+
     const ctx = this.ctx;
     const gain = this.ambientGain;
+
+    // Anchor current value before ramping to zero to prevent audible clicks
+    gain.gain.cancelScheduledValues(ctx.currentTime);
+    gain.gain.setValueAtTime(gain.gain.value, ctx.currentTime);
     gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.4);
-    window.setTimeout(() => this.stopAmbientInternal(), 450);
+
+    if (this.stopTimeoutId !== null) {
+      window.clearTimeout(this.stopTimeoutId);
+    }
+
+    this.stopTimeoutId = window.setTimeout(() => {
+      this.stopAmbientInternal();
+      this.stopTimeoutId = null;
+    }, 450);
+
     this.currentTrack = "none";
   }
 
@@ -183,7 +219,7 @@ class ProceduralAudioEngine {
 
       const gain = ctx.createGain();
       const start = now + i * 0.09;
-      gain.gain.setValueAtTime(0, start);
+      gain.gain.setValueAtTime(0.0001, start);
       gain.gain.linearRampToValueAtTime(0.18, start + 0.04);
       gain.gain.exponentialRampToValueAtTime(0.0001, start + 1.1);
 
@@ -201,9 +237,11 @@ class ProceduralAudioEngine {
     const osc = ctx.createOscillator();
     osc.type = "square";
     osc.frequency.value = 880;
+
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(0.09, now);
     gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
+
     osc.connect(gain);
     gain.connect(this.masterGain!);
     osc.start(now);
@@ -211,5 +249,5 @@ class ProceduralAudioEngine {
   }
 }
 
-// Singleton — a single AudioContext must be reused across the app.
+// Singleton — a single AudioContext reused across the app lifecycle
 export const audioEngine = new ProceduralAudioEngine();
